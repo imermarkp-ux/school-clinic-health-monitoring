@@ -1,12 +1,15 @@
 import os
-from dotenv import load_dotenv
-load_dotenv()
-
 import csv
 import io
+import logging
+import threading
 from contextlib import contextmanager
 from datetime import datetime, date
 from functools import wraps
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import psycopg
 from psycopg.rows import dict_row
@@ -18,26 +21,72 @@ from flask import (
     flash, session, Response, abort
 )
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-in-vercel-environment")
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = True
+# =====================================================
+# APPLICATION CONFIGURATION
+# =====================================================
 
+app = Flask(__name__)
+
+secret_key = os.environ.get("SECRET_KEY")
+if not secret_key:
+    # A predictable fallback is unsafe for production sessions.
+    raise RuntimeError(
+        "SECRET_KEY is missing. Set a long random SECRET_KEY "
+        "in your local .env file and in Vercel Environment Variables."
+    )
+
+app.secret_key = secret_key
+app.config.update(
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL")),
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 8,  # 8 hours
+)
+
+
+# =====================================================
+# DATABASE CONNECTION
+# =====================================================
 
 def get_database_url():
-    url = os.environ.get("DATABASE_URL")
+    """Return the PostgreSQL URL from the environment."""
+    url = os.environ.get("DATABASE_URL", "").strip()
+
     if not url:
         raise RuntimeError("DATABASE_URL is missing.")
+
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
+
+    if not url.startswith(("postgresql://", "postgresql+psycopg://")):
+        raise RuntimeError(
+            "DATABASE_URL must be a valid PostgreSQL connection URL."
+        )
+
+    # psycopg accepts postgresql:// URLs. Normalize SQLAlchemy-style URLs
+    # if one was copied from a provider dashboard.
+    if url.startswith("postgresql+psycopg://"):
+        url = "postgresql://" + url[len("postgresql+psycopg://"):]
+
     return url
 
 
 @contextmanager
 def db():
-    conn = psycopg.connect(get_database_url(), row_factory=dict_row)
+    """
+    Open one database connection for one operation.
+
+    prepare_threshold=None is useful with PgBouncer/Supabase pooler
+    connections because it avoids server-side prepared statements.
+    """
+    conn = psycopg.connect(
+        get_database_url(),
+        row_factory=dict_row,
+        connect_timeout=10,
+        sslmode="require",
+        prepare_threshold=None,
+    )
     try:
         with conn:
             yield conn
@@ -50,6 +99,7 @@ def db():
 # =====================================================
 
 def init_db():
+    """Create required tables and synchronize configured staff accounts."""
     with db() as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -80,7 +130,8 @@ def init_db():
         con.execute("""
             CREATE TABLE IF NOT EXISTS visits (
                 id BIGSERIAL PRIMARY KEY,
-                student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                student_id BIGINT NOT NULL
+                    REFERENCES students(id) ON DELETE CASCADE,
                 visit_date TEXT NOT NULL,
                 visit_time TEXT NOT NULL,
                 complaint TEXT NOT NULL,
@@ -94,8 +145,10 @@ def init_db():
         con.execute("""
             CREATE TABLE IF NOT EXISTS vitals (
                 id BIGSERIAL PRIMARY KEY,
-                student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-                visit_id BIGINT REFERENCES visits(id) ON DELETE SET NULL,
+                student_id BIGINT NOT NULL
+                    REFERENCES students(id) ON DELETE CASCADE,
+                visit_id BIGINT
+                    REFERENCES visits(id) ON DELETE SET NULL,
                 recorded_at TEXT NOT NULL,
                 temperature DOUBLE PRECISION,
                 systolic INTEGER,
@@ -109,43 +162,110 @@ def init_db():
             )
         """)
 
-        # Synchronize configured admin and nurse accounts.
-        # These environment variables are authoritative for these two accounts.
-        seeded_at = datetime.now().isoformat(timespec="seconds")
+        seeded_at = now_stamp()
 
-        demo_accounts = [
+        configured_accounts = [
             (
                 os.environ.get("ADMIN_USERNAME", "admin").strip(),
                 os.environ.get("ADMIN_PASSWORD", ""),
-                "admin"
+                "admin",
             ),
             (
                 os.environ.get("NURSE_USERNAME", "nurse").strip(),
                 os.environ.get("NURSE_PASSWORD", ""),
-                "nurse"
-            )
+                "nurse",
+            ),
         ]
 
-        for username, password, role in demo_accounts:
-            if username and password:
-                con.execute("""
-                    INSERT INTO users (
-                        username,
-                        password_hash,
-                        role,
-                        created_at
-                    )
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (username)
-                    DO UPDATE SET
-                        password_hash = EXCLUDED.password_hash,
-                        role = EXCLUDED.role
-                """, (
-                    username,
-                    generate_password_hash(password),
+        for username, password, role in configured_accounts:
+            if not username or not password:
+                app.logger.warning(
+                    "Skipping configured %s account: username or password is missing.",
                     role,
-                    seeded_at
-                ))
+                )
+                continue
+
+            con.execute("""
+                INSERT INTO users (
+                    username, password_hash, role, created_at
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (username)
+                DO UPDATE SET
+                    password_hash = EXCLUDED.password_hash,
+                    role = EXCLUDED.role
+            """, (
+                username,
+                generate_password_hash(password),
+                role,
+                seeded_at,
+            ))
+
+
+# Initialize lazily on the first request, not while Vercel imports app.py.
+# The lock prevents two requests in the same Python process from initializing
+# the schema simultaneously.
+_db_initialized = False
+_db_init_lock = threading.Lock()
+
+
+@app.before_request
+def ensure_database_initialized():
+    global _db_initialized
+
+    if _db_initialized:
+        return None
+
+    with _db_init_lock:
+        if _db_initialized:
+            return None
+
+        try:
+            init_db()
+            _db_initialized = True
+        except Exception:
+            app.logger.exception("Database initialization failed.")
+            return (
+                "The application could not connect to or initialize its database. "
+                "Check DATABASE_URL and the Vercel deployment logs.",
+                503,
+            )
+
+    return None
+
+
+# =====================================================
+# GENERAL HELPERS
+# =====================================================
+
+def now_stamp():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def valid_iso_date(value):
+    try:
+        date.fromisoformat(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def valid_time(value):
+    try:
+        datetime.strptime(value, "%H:%M")
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+@app.context_processor
+def inject_globals():
+    return {
+        "today": date.today().isoformat(),
+        "current_time": datetime.now().strftime("%H:%M"),
+        "current_user": session.get("username"),
+        "current_role": session.get("role"),
+    }
 
 
 # =====================================================
@@ -172,45 +292,35 @@ def admin_required(fn):
 
 
 # =====================================================
-# GENERAL HELPERS
-# =====================================================
-
-def now_stamp():
-    return datetime.now().isoformat(timespec="seconds")
-
-
-@app.context_processor
-def inject_globals():
-    return {
-        "today": date.today().isoformat(),
-        "current_time": datetime.now().strftime("%H:%M"),
-        "current_user": session.get("username"),
-        "current_role": session.get("role"),
-    }
-
-
-# =====================================================
 # LOGIN
 # =====================================================
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    if session.get("user_id"):
+        return redirect(url_for("dashboard"))
+
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
         with db() as con:
             user = con.execute(
-                "SELECT * FROM users WHERE username = %s",
-                (username,)
+                """
+                SELECT id, username, password_hash, role
+                FROM users
+                WHERE username = %s
+                """,
+                (username,),
             ).fetchone()
 
         if user and check_password_hash(user["password_hash"], password):
             session.clear()
+            session.permanent = True
             session.update({
                 "user_id": user["id"],
                 "username": user["username"],
-                "role": user["role"]
+                "role": user["role"],
             })
             return redirect(url_for("dashboard"))
 
@@ -243,13 +353,13 @@ def logout():
 @login_required
 def dashboard():
     with db() as con:
-        students = con.execute(
+        students_count = con.execute(
             "SELECT COUNT(*) AS n FROM students"
         ).fetchone()["n"]
 
         visits_today = con.execute(
-            "SELECT COUNT(*) AS n FROM visits WHERE visit_date=%s",
-            (date.today().isoformat(),)
+            "SELECT COUNT(*) AS n FROM visits WHERE visit_date = %s",
+            (date.today().isoformat(),),
         ).fetchone()["n"]
 
         total_visits = con.execute(
@@ -293,7 +403,7 @@ def dashboard():
 
     return render_template(
         "dashboard.html",
-        students=students,
+        students=students_count,
         visits_today=visits_today,
         total_visits=total_visits,
         recent=recent,
@@ -337,8 +447,8 @@ def students():
 def add_student():
     if request.method == "POST":
         fields = {
-            k: request.form.get(k, "").strip()
-            for k in [
+            key: request.form.get(key, "").strip()
+            for key in [
                 "student_no", "full_name", "grade_level", "section",
                 "birth_date", "guardian_name", "guardian_contact",
                 "allergies", "notes",
@@ -352,24 +462,34 @@ def add_student():
         ):
             flash(
                 "Student number, full name, and grade level are required.",
-                "error"
+                "error",
             )
+            return render_template("student_form.html", student=fields)
+
+        if fields["birth_date"] and not valid_iso_date(fields["birth_date"]):
+            flash("Enter a valid birth date.", "error")
             return render_template("student_form.html", student=fields)
 
         try:
             with db() as con:
                 con.execute("""
-                    INSERT INTO students(
-                        student_no, full_name, grade_level, section, birth_date,
-                        guardian_name, guardian_contact, allergies, notes, created_at
+                    INSERT INTO students (
+                        student_no, full_name, grade_level, section,
+                        birth_date, guardian_name, guardian_contact,
+                        allergies, notes, created_at
                     )
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
-                    fields["student_no"], fields["full_name"],
-                    fields["grade_level"], fields["section"],
-                    fields["birth_date"], fields["guardian_name"],
-                    fields["guardian_contact"], fields["allergies"],
-                    fields["notes"], now_stamp(),
+                    fields["student_no"],
+                    fields["full_name"],
+                    fields["grade_level"],
+                    fields["section"],
+                    fields["birth_date"],
+                    fields["guardian_name"],
+                    fields["guardian_contact"],
+                    fields["allergies"],
+                    fields["notes"],
+                    now_stamp(),
                 ))
 
             flash("Student record added.", "success")
@@ -386,8 +506,8 @@ def add_student():
 def student_detail(student_id):
     with db() as con:
         student = con.execute(
-            "SELECT * FROM students WHERE id=%s",
-            (student_id,)
+            "SELECT * FROM students WHERE id = %s",
+            (student_id,),
         ).fetchone()
 
         if not student:
@@ -396,14 +516,14 @@ def student_detail(student_id):
         visits = con.execute("""
             SELECT *
             FROM visits
-            WHERE student_id=%s
+            WHERE student_id = %s
             ORDER BY visit_date DESC, visit_time DESC
         """, (student_id,)).fetchall()
 
         vitals = con.execute("""
             SELECT *
             FROM vitals
-            WHERE student_id=%s
+            WHERE student_id = %s
             ORDER BY recorded_at DESC
             LIMIT 10
         """, (student_id,)).fetchall()
@@ -412,7 +532,7 @@ def student_detail(student_id):
         "student_detail.html",
         student=student,
         visits=visits,
-        vitals=vitals
+        vitals=vitals,
     )
 
 
@@ -432,8 +552,8 @@ def add_visit():
 
     if request.method == "POST":
         student_id = request.form.get("student_id", type=int)
-        visit_date = request.form.get("visit_date", "")
-        visit_time = request.form.get("visit_time", "")
+        visit_date = request.form.get("visit_date", "").strip()
+        visit_time = request.form.get("visit_time", "").strip()
         complaint = request.form.get("complaint", "").strip()
         action = request.form.get("action_taken", "").strip()
         referred = request.form.get("referred_to", "").strip()
@@ -441,36 +561,46 @@ def add_visit():
         if not student_id or not visit_date or not visit_time or not complaint:
             flash(
                 "Student, date, time, and reason for visit are required.",
-                "error"
+                "error",
             )
+            return render_template("visit_form.html", students=roster)
+
+        if not valid_iso_date(visit_date) or not valid_time(visit_time):
+            flash("Enter a valid visit date and time.", "error")
             return render_template("visit_form.html", students=roster)
 
         with db() as con:
             exists = con.execute(
-                "SELECT 1 FROM students WHERE id=%s",
-                (student_id,)
+                "SELECT 1 FROM students WHERE id = %s",
+                (student_id,),
             ).fetchone()
 
             if not exists:
                 abort(400)
 
             visit_id = con.execute("""
-                INSERT INTO visits(
+                INSERT INTO visits (
                     student_id, visit_date, visit_time, complaint,
                     action_taken, referred_to, recorded_by, created_at
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
             """, (
-                student_id, visit_date, visit_time, complaint,
-                action, referred, session["username"], now_stamp(),
+                student_id,
+                visit_date,
+                visit_time,
+                complaint,
+                action,
+                referred,
+                session["username"],
+                now_stamp(),
             )).fetchone()["id"]
 
         flash("Clinic visit recorded.", "success")
         return redirect(url_for(
             "add_vitals",
             student_id=student_id,
-            visit_id=visit_id
+            visit_id=visit_id,
         ))
 
     return render_template("visit_form.html", students=roster)
@@ -500,34 +630,50 @@ def add_vitals():
         """).fetchall()
 
         selected = con.execute(
-            "SELECT * FROM students WHERE id=%s",
-            (student_id,)
+            "SELECT * FROM students WHERE id = %s",
+            (student_id,),
         ).fetchone() if student_id else None
 
         if student_id and not selected:
             abort(404)
 
+        if visit_id:
+            visit = con.execute(
+                "SELECT id, student_id FROM visits WHERE id = %s",
+                (visit_id,),
+            ).fetchone()
+            if not visit or visit["student_id"] != student_id:
+                abort(400)
+
     if request.method == "POST":
         def num(name, cast=float):
             raw = request.form.get(name, "").strip()
-            return cast(raw) if raw else None
+            if not raw:
+                return None
+            return cast(raw)
 
         try:
+            if not student_id:
+                raise ValueError("A student must be selected.")
+
             vals = (
-                student_id, visit_id, now_stamp(), num("temperature"),
-                num("systolic", int), num("diastolic", int),
-                num("pulse", int), num("respiratory_rate", int),
-                num("height_cm"), num("weight_kg"),
+                student_id,
+                visit_id,
+                now_stamp(),
+                num("temperature"),
+                num("systolic", int),
+                num("diastolic", int),
+                num("pulse", int),
+                num("respiratory_rate", int),
+                num("height_cm"),
+                num("weight_kg"),
                 request.form.get("notes", "").strip(),
                 session["username"],
             )
 
-            if not student_id:
-                raise ValueError
-
             with db() as con:
                 con.execute("""
-                    INSERT INTO vitals(
+                    INSERT INTO vitals (
                         student_id, visit_id, recorded_at, temperature,
                         systolic, diastolic, pulse, respiratory_rate,
                         height_cm, weight_kg, notes, recorded_by
@@ -536,12 +682,15 @@ def add_vitals():
                 """, vals)
 
             flash("Vital signs saved.", "success")
-            return redirect(url_for("student_detail", student_id=student_id))
+            return redirect(url_for(
+                "student_detail",
+                student_id=student_id,
+            ))
 
         except (ValueError, TypeError):
             flash(
                 "Check the student selection and numeric vital-sign values.",
-                "error"
+                "error",
             )
 
     return render_template(
@@ -549,7 +698,7 @@ def add_vitals():
         students=roster,
         selected=selected,
         student_id=student_id,
-        visit_id=visit_id
+        visit_id=visit_id,
     )
 
 
@@ -595,11 +744,16 @@ def export_reports():
 
     writer.writerows([
         (
-            r["visit_date"], r["visit_time"], r["student_no"],
-            r["full_name"], r["complaint"], r["action_taken"],
-            r["referred_to"], r["recorded_by"],
+            row["visit_date"],
+            row["visit_time"],
+            row["student_no"],
+            row["full_name"],
+            row["complaint"],
+            row["action_taken"],
+            row["referred_to"],
+            row["recorded_by"],
         )
-        for r in rows
+        for row in rows
     ])
 
     return Response(
@@ -607,7 +761,8 @@ def export_reports():
         mimetype="text/csv",
         headers={
             "Content-Disposition":
-            "attachment; filename=clinic_visits_report.csv"
+                "attachment; filename=clinic_visits_report.csv",
+            "Cache-Control": "no-store",
         },
     )
 
@@ -624,16 +779,22 @@ def users():
         password = request.form.get("password", "")
         role = request.form.get("role", "nurse")
 
-        if not username or len(password) < 10 or role not in ("admin", "nurse"):
+        if (
+            not username
+            or len(username) > 100
+            or len(password) < 10
+            or role not in ("admin", "nurse")
+        ):
             flash(
-                "Enter a username, a password of at least 10 characters, and a valid role.",
-                "error"
+                "Enter a username, a password of at least 10 characters, "
+                "and a valid role.",
+                "error",
             )
         else:
             try:
                 with db() as con:
                     con.execute("""
-                        INSERT INTO users(
+                        INSERT INTO users (
                             username, password_hash, role, created_at
                         )
                         VALUES (%s,%s,%s,%s)
@@ -664,7 +825,7 @@ def users():
 # =====================================================
 
 @app.errorhandler(403)
-def forbidden(_):
+def forbidden(_error):
     return render_template(
         "error.html",
         code=403,
@@ -673,7 +834,7 @@ def forbidden(_):
 
 
 @app.errorhandler(404)
-def not_found(_):
+def not_found(_error):
     return render_template(
         "error.html",
         code=404,
@@ -681,16 +842,32 @@ def not_found(_):
     ), 404
 
 
-# =====================================================
-# INITIALIZE DATABASE
-# =====================================================
+@app.errorhandler(413)
+def request_too_large(_error):
+    return (
+        "The uploaded/request data is too large. Maximum size is 2 MB.",
+        413,
+    )
 
-init_db()
+
+@app.errorhandler(psycopg.OperationalError)
+def database_unavailable(_error):
+    app.logger.exception("PostgreSQL connection error.")
+    return (
+        "The database is temporarily unavailable. "
+        "Check the DATABASE_URL setting and database status.",
+        503,
+    )
 
 
 # =====================================================
-# RUN APPLICATION
+# LOCAL DEVELOPMENT
 # =====================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Debug mode is only enabled for local development.
+    app.run(
+        host="127.0.0.1",
+        port=int(os.environ.get("PORT", "5000")),
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+    )
